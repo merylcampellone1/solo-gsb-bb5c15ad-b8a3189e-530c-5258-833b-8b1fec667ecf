@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import json
+import secrets
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -17,6 +19,12 @@ STATUS_ACKED = "acked"
 
 # 每个事件最多声明的唯一依赖数量（API 层同样校验，这里只做防御性常量）
 MAX_DEPENDENCIES = 20
+
+# 批量领取数量与租约秒数的取值范围（API 层同样校验）
+MIN_CLAIM_COUNT = 1
+MAX_CLAIM_COUNT = 100
+MIN_LEASE_SECONDS = 1
+MAX_LEASE_SECONDS = 300
 
 # 多连接场景下 BEGIN IMMEDIATE 可能立即返回 SQLITE_BUSY；短暂退避后重试，
 # 避免高并发写争用时把可恢复的锁等待冒泡成 500。
@@ -102,10 +110,35 @@ class InvalidCursorError(Exception):
     pass
 
 
+class InvalidClaimTokenError(Exception):
+    """释放时令牌与当前有效领取不匹配（无领取、令牌错误或租约已到期）。
+
+    到期的旧令牌不再有效；释放失败不改变任何状态。
+    """
+
+    def __init__(self, event_id: str) -> None:
+        super().__init__(event_id)
+        self.event_id = event_id
+
+
+class EventAlreadyAckedClaimError(Exception):
+    """释放的目标事件已确认：领取行在确认时已清除，令牌必然失效。"""
+
+    def __init__(self, event_id: str) -> None:
+        super().__init__(event_id)
+        self.event_id = event_id
+
+
 def utcnow_iso() -> str:
     """固定 6 位小数的 UTC ISO-8601 字符串，保证字典序 == 时间序。"""
     now = datetime.now(timezone.utc)
     return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond:06d}Z"
+
+
+def unix_to_iso(epoch_seconds: int) -> str:
+    """Unix 秒转固定 6 位小数的 UTC ISO-8601（租约到期时刻对外格式）。"""
+    dt = datetime.fromtimestamp(epoch_seconds, tz=timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond:06d}Z"
 
 
 def canonical_json(value: Any) -> str:
@@ -664,6 +697,107 @@ class EventStore:
             params.extend([c_created, c_created, c_id])
         return self._list_page(f"WHERE {' AND '.join(clauses)}", params, limit)
 
+    def claim_events(self, count: int, lease_seconds: int) -> list[dict]:
+        """并发安全地领取一批就绪事件并加租约。
+
+        可领取条件（缺一不可）：事件为 pending、全部前置依赖均已 ack、且
+        当前没有有效领取（event_claims 中不存在未到期行）。按
+        (created_at, event_id) 升序选取至多 count 项。
+
+        全部判定与令牌写入在同一个 BEGIN IMMEDIATE 事务内完成（连接级锁
+        + SQLite 写串行化），因此并发领取不会分到同一事件：后到的领取者
+        只能看到前一事务已提交的领取行。到期行在事务开头惰性删除
+        （expires_at <= now），到期未确认的事件立即可被重新领取，且旧令牌
+        随之失效。返回每项的完整事件记录、不透明 claim_token 与
+        lease_expires_at（ISO-8601）；没有可领事件时返回空列表。
+        """
+        now = int(time.time())
+        expires_at = now + lease_seconds
+
+        def operation(conn):
+            # 惰性清除到期领取：旧令牌立即失效，事件恢复可领
+            conn.execute(
+                "DELETE FROM event_claims WHERE expires_at <= ?", (now,)
+            )
+            rows = conn.execute(
+                """
+                SELECT e.* FROM events e
+                WHERE e.status = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM event_claims c
+                      WHERE c.event_id = e.event_id AND c.expires_at > ?
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM event_dependencies d
+                      JOIN events p ON p.event_id = d.depends_on
+                      WHERE d.event_id = e.event_id AND p.status = 'pending'
+                  )
+                ORDER BY e.created_at, e.event_id
+                LIMIT ?
+                """,
+                (STATUS_PENDING, now, count),
+            ).fetchall()
+            claimed = []
+            for row in rows:
+                token = secrets.token_urlsafe(32)
+                conn.execute(
+                    "INSERT INTO event_claims (event_id, token, expires_at) VALUES (?, ?, ?)",
+                    (row["event_id"], token, expires_at),
+                )
+                claimed.append((row, token))
+            dep_map = _dependencies_for(
+                conn, [row["event_id"] for row, _ in claimed]
+            )
+            return claimed, dep_map, expires_at
+
+        claimed, dep_map, expires_at = self._run_immediate_tx(operation)
+        return [
+            {
+                **_row_to_event(row, dep_map.get(row["event_id"], [])),
+                "claim_token": token,
+                "lease_expires_at": unix_to_iso(expires_at),
+            }
+            for row, token in claimed
+        ]
+
+    def release_claim(self, event_id: str, token: str) -> dict:
+        """持有效令牌提前释放领取。
+
+        事件不存在抛 EventNotFoundError；事件已确认（领取行在确认时已清除）
+        抛 EventAlreadyAckedClaimError；无有效领取、租约已到期或令牌错误抛
+        InvalidClaimTokenError。后两类失败均不改变任何状态。成功时删除领取
+        行，事件立即恢复可被领取，返回事件当前记录。判定与删除同在一个
+        BEGIN IMMEDIATE 事务内，令牌比较使用常量时间比较。
+        """
+
+        def operation(conn):
+            now = int(time.time())
+            # 与领取路径一致地清除到期行：到期令牌一律按无效处理
+            conn.execute(
+                "DELETE FROM event_claims WHERE expires_at <= ?", (now,)
+            )
+            row = conn.execute(
+                "SELECT * FROM events WHERE event_id = ?", (event_id,)
+            ).fetchone()
+            if row is None:
+                raise EventNotFoundError(event_id)
+            if row["status"] == STATUS_ACKED:
+                raise EventAlreadyAckedClaimError(event_id)
+            claim = conn.execute(
+                "SELECT token FROM event_claims WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            if claim is None or not hmac.compare_digest(claim["token"], token):
+                raise InvalidClaimTokenError(event_id)
+            conn.execute(
+                "DELETE FROM event_claims WHERE event_id = ?", (event_id,)
+            )
+            dep_map = _dependencies_for(conn, [event_id])
+            return row, dep_map[event_id]
+
+        row, deps = self._run_immediate_tx(operation)
+        return _row_to_event(row, deps)
+
     def ack_event(self, event_id: str) -> dict:
         """确认单条事件。幂等：重复确认返回当前状态。
 
@@ -699,6 +833,10 @@ class EventStore:
                 conn.execute(
                     "UPDATE events SET status = ?, acked_at = ? WHERE event_id = ?",
                     (STATUS_ACKED, utcnow_iso(), event_id),
+                )
+                # 确认即清除领取（无论该行是否存在 / 是否已到期）
+                conn.execute(
+                    "DELETE FROM event_claims WHERE event_id = ?", (event_id,)
                 )
                 row = conn.execute(
                     "SELECT * FROM events WHERE event_id = ?", (event_id,)
@@ -800,6 +938,10 @@ class EventStore:
                     conn.execute(
                         "UPDATE events SET status = ?, acked_at = ? WHERE event_id = ?",
                         (STATUS_ACKED, utcnow_iso(), event_id),
+                    )
+                    # 确认即清除领取：已 ack 事件不会再有有效领取
+                    conn.execute(
+                        "DELETE FROM event_claims WHERE event_id = ?", (event_id,)
                     )
                     acked.add(event_id)
                 remaining = [event_id for event_id in remaining if event_id not in acked]

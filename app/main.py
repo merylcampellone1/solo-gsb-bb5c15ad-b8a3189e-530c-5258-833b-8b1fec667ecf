@@ -19,14 +19,20 @@ from .auth import (
 from .db import Database
 from .store import (
     MAX_DEPENDENCIES,
+    MAX_CLAIM_COUNT,
+    MAX_LEASE_SECONDS,
+    MIN_CLAIM_COUNT,
+    MIN_LEASE_SECONDS,
     BatchAckBlockedError,
     BatchAckNotFoundError,
     BatchConflictError,
     DependencyError,
+    EventAlreadyAckedClaimError,
     EventBlockedError,
     EventConflictError,
     EventNotFoundError,
     EventStore,
+    InvalidClaimTokenError,
     InvalidCursorError,
     ReplayError,
     content_hash,
@@ -108,6 +114,30 @@ class BlockerRootsOut(BaseModel):
     root_blockers: list[BlockerRootOut]
 
 
+class ClaimBatchIn(BaseModel):
+    # 本次最多领取的事件数（1~100）；没有足够可领事件时按实际数量返回
+    count: int = Field(ge=MIN_CLAIM_COUNT, le=MAX_CLAIM_COUNT)
+    # 租约秒数（1~300）：到期未确认则领取失效、事件可被他人重新领取
+    lease_seconds: int = Field(ge=MIN_LEASE_SECONDS, le=MAX_LEASE_SECONDS)
+
+
+class ClaimedEventOut(EventOut):
+    # 本次领取的不透明令牌：提前释放时须原样回传；租约到期后立即失效
+    claim_token: str
+    # 租约到期时刻（UTC ISO-8601）
+    lease_expires_at: str
+
+
+class ClaimBatchOut(BaseModel):
+    # 按 (created_at, event_id) 升序返回；没有可领事件时为空列表
+    items: list[ClaimedEventOut]
+
+
+class ClaimReleaseIn(BaseModel):
+    # 领取时返回的 claim_token；令牌错误或已到期返回 409 且不改变状态
+    claim_token: str = Field(min_length=1, max_length=256)
+
+
 @dataclass(frozen=True)
 class AuthenticatedRequest:
     """验签通过后的请求上下文。"""
@@ -176,7 +206,7 @@ async def lifespan(app: FastAPI):
     db.close()
 
 
-app = FastAPI(title="Webhook Inbox", version="1.4.0", lifespan=lifespan)
+app = FastAPI(title="Webhook Inbox", version="1.5.0", lifespan=lifespan)
 
 
 def get_store(request: Request) -> EventStore:
@@ -479,6 +509,59 @@ def ack_events_batch(
     record_by_id = {record["event_id"]: record for record in records}
     items = [record_by_id[event_id] for event_id in batch.event_ids]
     return {"items": items}
+
+
+@app.post("/events/claim", response_model=ClaimBatchOut)
+def claim_events(
+    claim: ClaimBatchIn,
+    store: EventStore = Depends(get_store),
+):
+    """批量领取待处理事件（加租约），供多个处理者并发拉取。
+
+    仅领取 pending、全部前置均已 ack 且当前没有有效领取（未到期）的事件，
+    按 (created_at, event_id) 升序选取至多 count 项；返回每项事件、
+    claim_token 与 lease_expires_at。领取判定与令牌写入在同一个
+    BEGIN IMMEDIATE 事务内完成，并发领取不会分到同一事件。租约到期后仍未
+    确认的事件可被重新领取且旧令牌失效；没有可领事件时返回空列表。
+    count（1~100）或 lease_seconds（1~300）越界返回 422。无需签名头。
+    """
+    items = store.claim_events(claim.count, claim.lease_seconds)
+    return {"items": items}
+
+
+@app.post("/events/{event_id}/release", response_model=EventOut)
+def release_event(
+    event_id: str,
+    release: ClaimReleaseIn,
+    store: EventStore = Depends(get_store),
+):
+    """持有效领取令牌提前释放事件。
+
+    成功后领取行被删除、事件立即可被他人重新领取（不改变事件本身的
+    pending/acked 状态），返回事件当前记录。事件不存在返回 404；令牌错误、
+    租约已到期或当前没有有效领取，以及事件已确认（确认时领取已被清除），
+    均返回 409 且不改变任何状态。
+    """
+    try:
+        return store.release_claim(event_id, release.claim_token)
+    except EventNotFoundError:
+        raise HTTPException(status_code=404, detail="event not found")
+    except InvalidClaimTokenError:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "invalid or expired claim token",
+                "event_id": event_id,
+            },
+        )
+    except EventAlreadyAckedClaimError:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "event already acked",
+                "event_id": event_id,
+            },
+        )
 
 
 @app.get("/events/{event_id}", response_model=EventOut)

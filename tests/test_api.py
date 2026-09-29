@@ -22,10 +22,12 @@ from app.store import (
     BatchAckNotFoundError,
     BatchConflictError,
     DependencyError,
+    EventAlreadyAckedClaimError,
     EventBlockedError,
     EventConflictError,
     EventNotFoundError,
     EventStore,
+    InvalidClaimTokenError,
     ReplayError,
 )
 
@@ -1825,3 +1827,317 @@ def test_store_blocker_roots_read_does_not_mutate(store):
     assert store.get_event("b")["status"] == "pending"
     with pytest.raises(EventNotFoundError):
         store.get_blocker_roots("ghost")
+
+# ---------- 批量领取与租约：POST /events/claim、POST /events/{id}/release ----------
+
+
+def claim(client, count: int = 10, lease_seconds: int = 60):
+    return client.post(
+        "/events/claim", json={"count": count, "lease_seconds": lease_seconds}
+    )
+
+
+def release(client, event_id: str, token: str):
+    return client.post(
+        f"/events/{event_id}/release", json={"claim_token": token}
+    )
+
+
+def test_claim_returns_ready_pending_events_with_token_and_expiry(client):
+    post_event(client, make_event(1))
+    post_event(client, make_event(2))
+    r = claim(client, count=10, lease_seconds=60)
+    assert r.status_code == 200
+    items = r.json()["items"]
+    assert [it["event_id"] for it in items] == ["evt-0001", "evt-0002"]
+    for it in items:
+        assert it["status"] == "pending"
+        assert isinstance(it["claim_token"], str) and len(it["claim_token"]) > 20
+        assert it["lease_expires_at"].endswith("Z")
+        assert "T" in it["lease_expires_at"]
+    # 同一批所有领取共享同一到期时刻
+    assert items[0]["lease_expires_at"] == items[1]["lease_expires_at"]
+    # 领取后事件仍 pending：不改变处理状态
+    assert client.get("/events/evt-0001").json()["status"] == "pending"
+
+
+def test_claim_does_not_require_signature_headers(client):
+    post_event(client, make_event(1))
+    r = client.post("/events/claim", json={"count": 1, "lease_seconds": 5})
+    assert r.status_code == 200
+    assert len(r.json()["items"]) == 1
+
+
+def test_claim_respects_count_limit_and_order(client):
+    for i in range(5):
+        post_event(client, make_event(i + 1))
+    r = claim(client, count=2, lease_seconds=60)
+    assert [it["event_id"] for it in r.json()["items"]] == ["evt-0001", "evt-0002"]
+    r = claim(client, count=2, lease_seconds=60)
+    assert [it["event_id"] for it in r.json()["items"]] == ["evt-0003", "evt-0004"]
+    # 只剩 1 个可领：按实际数量返回
+    r = claim(client, count=10, lease_seconds=60)
+    assert [it["event_id"] for it in r.json()["items"]] == ["evt-0005"]
+
+
+def test_claim_returns_empty_when_nothing_claimable(client):
+    r = claim(client)
+    assert r.status_code == 200
+    assert r.json() == {"items": []}
+
+
+def test_claim_excludes_events_with_unacked_dependencies(client):
+    post_event(client, event_with_deps("a"))
+    post_event(client, event_with_deps("b", ["a"]))
+    # b 依赖仍 pending 的 a：只有 a 可领
+    r = claim(client, count=10, lease_seconds=60)
+    assert [it["event_id"] for it in r.json()["items"]] == ["a"]
+    # a 已被领取，b 依赖未 ack：无可领
+    assert claim(client).json()["items"] == []
+    # 确认 a 后 b 立即变为可领（领取不影响就绪解锁）
+    assert client.post("/events/a/ack").status_code == 200
+    r = claim(client)
+    assert [it["event_id"] for it in r.json()["items"]] == ["b"]
+
+
+def test_claim_excludes_acked_events(client):
+    post_event(client, make_event(1))
+    client.post("/events/evt-0001/ack")
+    assert claim(client).json()["items"] == []
+
+
+def test_claim_validation_out_of_range(client):
+    for body in (
+        {"count": 0, "lease_seconds": 60},
+        {"count": 101, "lease_seconds": 60},
+        {"count": 1, "lease_seconds": 0},
+        {"count": 1, "lease_seconds": 301},
+    ):
+        r = client.post("/events/claim", json=body)
+        assert r.status_code == 422, body
+    # 缺字段同样 422
+    assert client.post("/events/claim", json={"count": 1}).status_code == 422
+
+
+def test_claim_boundary_values_accepted(client):
+    post_event(client, make_event(1))
+    assert client.post(
+        "/events/claim", json={"count": 1, "lease_seconds": 1}
+    ).status_code == 200
+    # 已领取，立即再领为空（租期 1s 尚未到期）
+    assert claim(client, count=1, lease_seconds=1).json()["items"] == []
+
+
+def test_concurrent_claims_never_share_events_api(client):
+    for i in range(20):
+        post_event(client, make_event(i + 1))
+
+    def do_claim(_):
+        r = claim(client, count=3, lease_seconds=120)
+        return [it["event_id"] for it in r.json()["items"]]
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        batches = list(pool.map(do_claim, range(40)))
+    claimed_ids = [eid for batch in batches for eid in batch]
+    # 每个事件恰好被领取一次，总共 20 个
+    assert sorted(claimed_ids) == [f"evt-{i:04d}" for i in range(1, 21)]
+
+
+def test_concurrent_claims_multi_connection(tmp_path):
+    path = str(tmp_path / "claim-race.db")
+    seed = EventStore(Database(path))
+    for i in range(10):
+        seed.create_event(f"e{i}", "t", {}, source=SOURCE, nonce=f"s{i}")
+    seed.db.close()
+
+    def do_claim(_):
+        s = EventStore(Database(path))
+        try:
+            return [it["event_id"] for it in s.claim_events(4, 120)]
+        finally:
+            s.db.close()
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        batches = list(pool.map(do_claim, range(40)))
+    all_ids = [eid for batch in batches for eid in batch]
+    assert sorted(all_ids) == [f"e{i}" for i in range(10)]
+    assert len(all_ids) == len(set(all_ids))
+
+
+def test_claim_expired_lease_can_be_reclaimed_and_old_token_invalid(client, tmp_path):
+    post_event(client, make_event(1))
+    first = claim(client, count=1, lease_seconds=60).json()["items"][0]
+    old_token = first["claim_token"]
+    assert claim(client).json()["items"] == []
+
+    # 直接把租约改成已到期（-1s），模拟租期流逝
+    import pathlib
+
+    candidates = list(pathlib.Path(tmp_path).glob("*.db"))
+    assert candidates
+    conn = sqlite3.connect(candidates[0])
+    conn.execute(
+        "UPDATE event_claims SET expires_at = ? WHERE event_id = ?",
+        (int(time.time()) - 1, "evt-0001"),
+    )
+    conn.commit()
+    conn.close()
+
+    # 到期后可被重新领取，得到新令牌
+    second = claim(client, count=1, lease_seconds=60).json()["items"][0]
+    assert second["event_id"] == "evt-0001"
+    assert second["claim_token"] != old_token
+
+    # 旧令牌释放失败，且不影响新领取
+    r = release(client, "evt-0001", old_token)
+    assert r.status_code == 409
+    assert r.json()["detail"]["message"] == "invalid or expired claim token"
+    # 新令牌仍然有效（旧令牌失败未改变状态）
+    assert claim(client).json()["items"] == []
+
+
+def test_release_with_valid_token_moves_event_back_to_claimable(client):
+    post_event(client, make_event(1))
+    item = claim(client, count=1, lease_seconds=120).json()["items"][0]
+    r = release(client, "evt-0001", item["claim_token"])
+    assert r.status_code == 200
+    assert r.json()["event_id"] == "evt-0001"
+    assert r.json()["status"] == "pending"
+    # 释放后立即可被重新领取
+    again = claim(client, count=1, lease_seconds=120).json()["items"]
+    assert [it["event_id"] for it in again] == ["evt-0001"]
+
+
+def test_release_wrong_token_returns_409_and_keeps_claim(client):
+    post_event(client, make_event(1))
+    claim(client, count=1, lease_seconds=120)
+    r = release(client, "evt-0001", "not-the-real-token")
+    assert r.status_code == 409
+    assert r.json()["detail"]["message"] == "invalid or expired claim token"
+    # 状态不变：他人仍无法领取该事件
+    assert claim(client).json()["items"] == []
+
+
+def test_release_without_claim_returns_409(client):
+    post_event(client, make_event(1))
+    r = release(client, "evt-0001", "anything")
+    assert r.status_code == 409
+    assert r.json()["detail"]["message"] == "invalid or expired claim token"
+
+
+def test_release_expired_token_returns_409(client, tmp_path):
+    import pathlib
+
+    post_event(client, make_event(1))
+    item = claim(client, count=1, lease_seconds=60).json()["items"][0]
+    candidates = list(pathlib.Path(tmp_path).glob("*.db"))
+    conn = sqlite3.connect(candidates[0])
+    conn.execute(
+        "UPDATE event_claims SET expires_at = ? WHERE event_id = ?",
+        (int(time.time()) - 1, "evt-0001"),
+    )
+    conn.commit()
+    conn.close()
+    r = release(client, "evt-0001", item["claim_token"])
+    assert r.status_code == 409
+    assert r.json()["detail"]["message"] == "invalid or expired claim token"
+
+
+def test_release_not_found_returns_404(client):
+    r = release(client, "ghost", "tok")
+    assert r.status_code == 404
+    assert r.json() == {"detail": "event not found"}
+
+
+def test_release_after_ack_returns_409(client):
+    post_event(client, make_event(1))
+    item = claim(client, count=1, lease_seconds=120).json()["items"][0]
+    assert client.post("/events/evt-0001/ack").status_code == 200
+    r = release(client, "evt-0001", item["claim_token"])
+    assert r.status_code == 409
+    assert r.json()["detail"]["message"] == "event already acked"
+
+
+def test_release_empty_token_returns_422(client):
+    post_event(client, make_event(1))
+    r = client.post("/events/evt-0001/release", json={"claim_token": ""})
+    assert r.status_code == 422
+
+
+def test_ack_single_clears_claim_and_event_not_reclaimable(client):
+    post_event(client, make_event(1))
+    item = claim(client, count=1, lease_seconds=120).json()["items"][0]
+    assert client.post("/events/evt-0001/ack").status_code == 200
+    # 确认清除领取：已 ack 事件不会再被领取，旧令牌释放失败
+    assert claim(client).json()["items"] == []
+    r = release(client, "evt-0001", item["claim_token"])
+    assert r.status_code == 409
+    assert r.json()["detail"]["message"] == "event already acked"
+
+
+def test_ack_batch_clears_claims(client):
+    post_event(client, event_with_deps("a"))
+    post_event(client, event_with_deps("b", ["a"]))
+    claimed = {it["event_id"]: it["claim_token"] for it in claim(client, count=10).json()["items"]}
+    assert set(claimed) == {"a"}
+    # a 在领取状态下仍可按原依赖规则被批量确认（b 依赖 a，同批解锁）
+    r = client.post("/events/ack-batch", json={"event_ids": ["b", "a"]})
+    assert r.status_code == 200
+    assert claim(client).json()["items"] == []
+
+
+def test_ready_query_unaffected_by_claims(client):
+    """就绪查询仍按依赖状态列示事件，领取不改变其可见性。"""
+    post_event(client, make_event(1))
+    claim(client, count=1, lease_seconds=120)
+    ready = client.get("/events/ready").json()["items"]
+    assert [it["event_id"] for it in ready] == ["evt-0001"]
+
+
+def test_store_release_claim_error_types(store):
+    store.create_event("a", "t", {}, source=SOURCE, nonce="c0")
+    with pytest.raises(EventNotFoundError):
+        store.release_claim("ghost", "tok")
+    with pytest.raises(InvalidClaimTokenError):
+        store.release_claim("a", "tok")
+    items = store.claim_events(1, 60)
+    token = items[0]["claim_token"]
+    with pytest.raises(InvalidClaimTokenError):
+        store.release_claim("a", "wrong")
+    rec = store.release_claim("a", token)
+    assert rec["status"] == "pending"
+    # 释放后可重新领取
+    assert len(store.claim_events(1, 60)) == 1
+    store.ack_event("a")
+    with pytest.raises(EventAlreadyAckedClaimError):
+        store.release_claim("a", token)
+
+
+def test_legacy_database_upgrades_with_claims_table(tmp_path):
+    """旧库（无 event_claims）启动时增量建表，旧 pending 事件可直接领取。"""
+    path = str(tmp_path / "legacy-claims.db")
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE events (
+            event_id     TEXT PRIMARY KEY,
+            type         TEXT NOT NULL,
+            payload      TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            status       TEXT NOT NULL DEFAULT 'pending',
+            created_at   TEXT NOT NULL,
+            acked_at     TEXT
+        );
+        INSERT INTO events VALUES ('evt-old', 't', '{}', 'x',
+                                   'pending', '2026-09-01T00:00:00.000000Z', NULL);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    db = Database(path)
+    store = EventStore(db)
+    items = store.claim_events(10, 30)
+    assert [it["event_id"] for it in items] == ["evt-old"]
+    assert items[0]["lease_expires_at"].endswith("Z")
+    db.close()

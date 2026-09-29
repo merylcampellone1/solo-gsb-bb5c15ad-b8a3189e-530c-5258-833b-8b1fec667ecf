@@ -1,6 +1,6 @@
 # Webhook Inbox
 
-基于 FastAPI + SQLite 的 webhook 收件箱服务。接收事件、**来源签名校验与重放防护**、幂等去重、**事件依赖门禁**、按时间游标分页查询、就绪队列、单条确认与**批量确认**，数据持久化到 SQLite。
+基于 FastAPI + SQLite 的 webhook 收件箱服务。接收事件、**来源签名校验与重放防护**、幂等去重、**事件依赖门禁**、按时间游标分页查询、就绪队列、**批量领取（租约）与提前释放**、单条确认与**批量确认**，数据持久化到 SQLite。
 
 ## 功能
 
@@ -22,12 +22,14 @@
   - 与库中记录内容冲突 → **409** 并标出对应下标，**整批零写入**
   - 无冲突时**单一事务**写入全部新事件与依赖边，按原输入顺序返回记录与每项 `created` 标记
 - **GET /events** 按时间游标分页查询（键集分页，支持 `status` 过滤）
-- **GET /events/ready** 沿用相同游标规则，只列出**全部依赖均已 ack 的 pending 事件**；前置事件确认后后继**立即解锁**
-- **POST /events/{event_id}/ack** 单条确认（幂等，重复确认返回当前状态）；尚有未完成依赖时返回 **409** 与 `blockers` 列表
+- **GET /events/ready** 沿用相同游标规则，只列出**全部依赖均已 ack 的 pending 事件**；前置事件确认后后继**立即解锁**（领取状态不影响本查询）
+- **POST /events/claim** 批量领取待处理事件（数量 1~100、租期 1~300 秒，无需签名头）：只领取 pending、全部前置已 ack 且没有未到期领取的事件，按 `(created_at, event_id)` 升序返回每项事件、`claim_token` 与 `lease_expires_at`；并发领取互不分到同一事件，无可领事件返回 `{"items":[]}`，数量/租期越界返回 422
+- **POST /events/{event_id}/release** 持有效令牌提前释放领取（无需签名头）：成功后事件立即恢复可领且不改变 pending/acked 状态；令牌错误/租约到期/无有效领取返回 **409 且不改变状态**，事件不存在返回 404，事件已确认返回 409
+- **POST /events/{event_id}/ack** 单条确认（幂等，重复确认返回当前状态）；尚有未完成依赖时返回 **409** 与 `blockers` 列表；确认时**自动清除该事件的领取**，旧令牌随之失效
 - **POST /events/ack-batch** 批量确认（1~100 个 event_id，无需签名头）：按首次出现顺序去重、按原输入顺序返回每项结果；**允许先列后继、再列前置**，服务端在同一 SQLite 写事务内按依赖顺序确认；已确认事件幂等。任一 ID 不存在（**404**）或前置仍 pending 且不在本批待确认集合中（**409**，给出阻塞项与 `blockers`）时，可定位到原始下标且**整批状态不变**
 - **GET /events/{event_id}/blocker-roots** 阻塞根因定位：事件依赖链较长时，沿 **pending 依赖边**逐层追溯真正挡住确认的**最上游未确认前置**，返回目标当前状态、`can_ack` 以及每个根因的 ID 与从目标到它的路径（含两端）。汇合分支共享的同一根因只返回一次；多条路径选边数最少者，等长时按整条 ID 序列字典序选定，结果按根因 ID 排序
 - **GET /events/{event_id}** 查询单条事件
-- 事件、处理状态（`pending` / `acked`）与依赖边持久化到 SQLite，**启动时自动建表**；含 `used_nonces` 防重放表与 `event_dependencies` 依赖表，升级已有数据库时只增量补表、不动旧数据
+- 事件、处理状态（`pending` / `acked`）与依赖边持久化到 SQLite，**启动时自动建表**；含 `used_nonces` 防重放表、`event_dependencies` 依赖表与 `event_claims` 领取租约表，升级已有数据库时只增量补表、不动旧数据
 
 ## 快速开始（Docker，一键启动）
 
@@ -175,6 +177,10 @@ curl -i -X POST http://localhost:8000/events \
 | 查询单条事件 / 阻塞根因时 event_id 不存在 | 404，`{"detail":"event not found"}` |
 | 批量确认中前置仍 pending 且不在本批 | 409，返回 `blocked`（每项含原始下标与 `blockers`），整批状态不变 |
 | 批量确认 `event_ids` 为空或超过 100 个、含空字符串 | 422 |
+| 批量领取 `count` 不在 1~100、`lease_seconds` 不在 1~300、缺字段 | 422 |
+| 提前释放时令牌错误 / 租约已到期 / 当前没有有效领取 | 409，`{"message":"invalid or expired claim token"}`，不改变状态 |
+| 提前释放的事件已确认（确认时领取已清除） | 409，`{"message":"event already acked"}` |
+| 提前释放时事件不存在 | 404，`{"detail":"event not found"}` |
 
 ## API 一览
 
@@ -183,7 +189,9 @@ curl -i -X POST http://localhost:8000/events \
 | POST | `/events` | 提交事件（**需签名头**）。首次 `201`，重复（内容相同）`200`，内容冲突 `409`，鉴权失败 `401`，依赖校验失败 `422` |
 | POST | `/events/batch` | 原子批量提交（1~100 个，**需签名头**）。有新事件 `201`，全部重复 `200`；批内冲突 `422`、与库冲突 `409`、依赖错误（缺失/自依赖/环）`422`、重放/鉴权失败 `401`，均整批零写入 |
 | GET | `/events?limit=&cursor=&status=` | 时间游标分页查询，`limit` 默认 50、最大 200 |
-| GET | `/events/ready?limit=&cursor=` | 只列全部依赖均已 ack 的 pending 事件，游标规则同 `/events` |
+| GET | `/events/ready?limit=&cursor=` | 只列全部依赖均已 ack 的 pending 事件，游标规则同 `/events`（**领取状态不影响可见性**） |
+| POST | `/events/claim` | 批量领取（1~100 项、租期 1~300 秒，无需签名头）。返回每项事件 + `claim_token` + `lease_expires_at`，无可领返回空列表，并发领取互斥，越界 `422` |
+| POST | `/events/{event_id}/release` | 持有效令牌提前释放（无需签名头）。成功 `200` 返回事件当前记录；令牌错误/已到期 `409`（不改状态），事件不存在 `404`，事件已确认 `409` |
 | GET | `/events/{event_id}` | 查询单条事件，不存在 `404` |
 | GET | `/events/{event_id}/blocker-roots` | 阻塞根因定位：返回目标 `status` / `can_ack` 与最上游未确认前置的 ID 及追溯路径，不存在 `404` |
 | POST | `/events/{event_id}/ack` | 确认事件（幂等），不存在 `404`，尚有未完成依赖 `409`（含 `blockers`） |
@@ -349,6 +357,92 @@ curl -X POST http://localhost:8000/events/evt-001/ack
 
 把 `blockers` 中的事件逐一确认后即可确认本事件（已 ack 的依赖不再出现在 `blockers` 中）。
 
+### 批量领取与租约（多处理者拉取）
+
+多个处理者可通过 `POST /events/claim` 从收件箱**并发领取**一批待处理事件，无需签名头。请求体指定本次最多领取数量 `count`（**1~100**）与租约秒数 `lease_seconds`（**1~300**）：
+
+```bash
+curl -X POST http://localhost:8000/events/claim \
+  -H 'Content-Type: application/json' \
+  -d '{"count": 10, "lease_seconds": 60}'
+```
+
+只有同时满足以下条件的事件才会被领取：`status=pending`、**全部前置依赖均已 ack**（与 `/events/ready` 同一判定）、且当前**没有未到期的有效领取**。服务端按 `(created_at, event_id)` 升序选取至多 `count` 项；领取只是加租约、**不改变事件状态**（仍为 pending）：
+
+```json
+{
+  "items": [
+    {
+      "event_id": "evt-001",
+      "type": "order.paid",
+      "payload": {"amount": 100},
+      "status": "pending",
+      "created_at": "2026-09-29T12:00:00.000000Z",
+      "acked_at": null,
+      "depends_on": [],
+      "claim_token": "sMFePs8gQoAd4r3Nmm0hQcxw817eL3FaZ5A5C2ZA9ZA",
+      "lease_expires_at": "2026-09-29T12:01:00.000000Z"
+    }
+  ]
+}
+```
+
+- **并发互斥**：领取的可领判定与令牌写入在同一个 `BEGIN IMMEDIATE` 事务内完成，多个处理者同时领取**不会分到同一事件**；后到者只能领到剩余事件，没有可领事件时返回 `{"items": []}`（HTTP 200）。
+- **租约到期**：到期后仍未确认的事件自动恢复可被（任意处理者，包括自己）重新领取，重新领取会生成**新令牌、旧令牌立即失效**；到期行在下次领取/释放事务中惰性清理。
+- **提前释放**：处理者提前做完或主动放弃时，可凭领取令牌释放，事件立即回到可领集合（状态不变）：
+
+```bash
+curl -X POST http://localhost:8000/events/evt-001/release \
+  -H 'Content-Type: application/json' \
+  -d '{"claim_token": "sMFePs8gQoAd4r3Nmm0hQcxw817eL3FaZ5A5C2ZA9ZA"}'
+```
+
+成功返回 `200` 与事件当前记录。令牌错误、租约已到期或当前没有有效领取时返回 `409` 且**不改变任何状态**：
+
+```json
+{"detail": {"message": "invalid or expired claim token", "event_id": "evt-001"}}
+```
+
+事件不存在返回 `404 {"detail":"event not found"}`；事件已被确认（确认时领取已被清除）返回 `409 {"detail":{"message":"event already acked", ...}}`。
+
+- **确认即清除领取**：单条 `/events/{event_id}/ack` 与批量 `/events/ack-batch` 仍按原有依赖门禁规则直接生效（领取不是确认前置，也不阻止确认），确认提交时自动删除该事件的领取行。
+- **就绪查询不受影响**：`GET /events/ready` 仍只按依赖状态列示事件，无论是否被领取。
+- `count`/`lease_seconds` 越界或缺失返回 `422`（边界值 1 与 100/300 合法）。
+
+Python 调用示例（领取 → 处理 → 确认；异常路径提前释放或等待租约到期）：
+
+```python
+import json, urllib.request
+
+def claim(count=10, lease_seconds=60):
+    req = urllib.request.Request(
+        "http://localhost:8000/events/claim",
+        data=json.dumps({"count": count, "lease_seconds": lease_seconds}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req) as resp:
+        return json.load(resp)["items"]
+
+def post(path, payload):
+    req = urllib.request.Request(
+        f"http://localhost:8000{path}",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    return urllib.request.urlopen(req)  # 200
+
+for item in claim(count=10, lease_seconds=60):
+    event_id, token = item["event_id"], item["claim_token"]
+    try:
+        handle(item)                                   # 业务处理
+        post(f"/events/{event_id}/ack", {})            # 确认：自动清除领取
+    except RetryableError:
+        post(f"/events/{event_id}/release", {"claim_token": token})  # 主动释放
+    # 若处理者崩溃：租约到期后事件自动可被其他处理者重新领取，旧令牌失效
+```
+
 ### 批量确认
 
 `POST /events/ack-batch` 一次确认 1~100 个事件（与单条确认一样**无需签名头**）。请求体为 `event_ids` 数组：按**首次出现顺序去重**，允许请求**先列后继、再列前置**——服务端在同一个 SQLite 写事务内按依赖顺序（前置先于后继）确认；已确认事件保持幂等（沿用其既有 `acked_at`，不重写）。响应按**原输入顺序**返回每项完整事件（重复项映射到同一结果），字段与单条确认完全一致：
@@ -477,6 +571,7 @@ for root in info["root_blockers"]:
 - 依赖边存于独立的 `event_dependencies(event_id, depends_on)` 表（复合主键去重、集合语义），不修改既有 `events` 行；旧库启动时以 `CREATE TABLE IF NOT EXISTS` 增量建表并保留全部旧数据，旧事件视为无依赖、天然就绪。
 - **就绪判定与确认门禁**：`/events/ready` 与确认接口都以「不存在指向 pending 事件的依赖边」为准（单条 NOT EXISTS / JOIN 查询）。ack 只会把 pending 翻转为 acked，就绪集合随确认单调扩大，因此前置确认提交后后继立即解锁。确认路径同样运行在 `BEGIN IMMEDIATE` 事务内：门禁检查与状态翻转原子完成，多连接并发确认同一事件恰好翻转一次，其余请求幂等成功，不会出现“读到依赖已消失但状态未更新”的中间态。
 - **批量确认同一事务内按依赖顺序翻转**：`/events/ack-batch` 在单个 `BEGIN IMMEDIATE` 事务内一次性完成「存在性检查 + 外部阻塞判定 + 批内拓扑序确认 + 回读」。请求先列后继再列前置合法：批内条目的 pending 前置只要也在本批即不算阻塞，事务内沿依赖边做拓扑确认（落库图无环，入箱时已拒绝环）；前置在批外且仍 pending 才整体拒绝（409）并回滚。任一 ID 不存在（404）同样回滚，不存在部分确认；已 ack 条目幂等跳过、`acked_at` 保持首确值，多连接并发批次彼此串行。
+- **领取租约与并发互斥**：`event_claims(event_id PRIMARY KEY, token, expires_at)` 表为每个 pending 事件保存至多一行有效领取。`/events/claim` 在单个 `BEGIN IMMEDIATE` 事务内先惰性删除到期行（`expires_at <= now`），再以「pending ∧ 无未到期领取行 ∧ 不存在指向 pending 事件的依赖边」条件按 `(created_at, event_id)` 选取事件并写入随机令牌——连接级锁与 SQLite 写串行化保证并发领取不会分到同一事件，且领取判定与 `/events/ready` 使用同一条就绪谓词。租约到期后旧行在下次领取/释放事务中被清除，事件立即可重新领取，新领取生成新令牌、旧令牌失效。令牌为 `secrets.token_urlsafe(32)`，释放时用 `hmac.compare_digest` 常量时间比较；释放与领取共用同一把写锁，失败路径（无领取/到期/令牌错误/已确认）不写入任何变更。单条与批量确认在状态翻转的同事务内删除领取行，因此确认后旧令牌必然失效、已 ack 事件不会再被领取。`event_claims` 表同样以 `CREATE TABLE IF NOT EXISTS` 在旧库启动时增量补建，旧数据不受影响。
 - 批量写入在**单一事务**内完成「nonce 登记 + 查库比对 + 依赖校验 + 全部事件/依赖边插入 + 回读」（连接级锁 + `BEGIN IMMEDIATE`），并发批次彼此串行：任一冲突即整批回滚，不产生部分提交，也不会覆盖首个版本。
 - 验签使用 `hmac.compare_digest` 常量时间比较；所有鉴权失败返回相同的 401 响应，不泄露失败环节。
 
@@ -503,7 +598,7 @@ environment:
 ```bash
 pip install -r requirements-dev.txt
 export WEBHOOK_SECRETS_JSON='{"demo":{"current":"dev-only-secret-change-me"}}'
-pytest tests/ -q                 # 117 个测试：签名/重放/密钥轮换、幂等、409、分页、依赖门禁（缺失/自依赖/环）、就绪解锁、ack 并发、批量提交/批量确认原子性、阻塞根因追溯、旧库迁移、持久化
+pytest tests/ -q                 # 140 个测试：签名/重放/密钥轮换、幂等、409、分页、依赖门禁（缺失/自依赖/环）、就绪解锁、ack 并发、批量提交/批量确认原子性、阻塞根因追溯、领取租约（并发互斥/到期重领/释放错误路径/确认清除）、旧库迁移、持久化
 DATABASE_PATH=./events.db uvicorn app.main:app --reload --port 8000
 ```
 
@@ -513,8 +608,8 @@ DATABASE_PATH=./events.db uvicorn app.main:app --reload --port 8000
 app/
   main.py    # FastAPI 路由、签名头依赖与请求模型（验签后手动解析原始体）
   auth.py    # WEBHOOK_SECRETS_JSON 解析、HMAC-SHA256 验签、时间窗与轮换宽限
-  store.py   # nonce 登记 + 幂等写入与依赖校验（同一写事务）、依赖环检测、游标分页、就绪队列、门禁确认与批量拓扑确认、阻塞根因 pending 边 BFS 追溯（存储层）
-  db.py      # SQLite 连接、WAL、自动建表（events / used_nonces / event_dependencies）
+  store.py   # nonce 登记 + 幂等写入与依赖校验（同一写事务）、依赖环检测、游标分页、就绪队列、批量领取（租约令牌/到期惰性清理/并发互斥）与提前释放、门禁确认与批量拓扑确认、阻塞根因 pending 边 BFS 追溯（存储层）
+  db.py      # SQLite 连接、WAL、自动建表（events / used_nonces / event_dependencies / event_claims）
 tests/
   test_api.py
 Dockerfile
