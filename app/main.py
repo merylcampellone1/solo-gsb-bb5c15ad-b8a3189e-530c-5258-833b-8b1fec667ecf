@@ -18,15 +18,20 @@ from .auth import (
 )
 from .db import Database
 from .store import (
+    MAX_CLAIM_COUNT,
     MAX_DEPENDENCIES,
+    MAX_LEASE_SECONDS,
     BatchAckBlockedError,
     BatchAckNotFoundError,
     BatchConflictError,
+    ClaimTokenError,
     DependencyError,
+    EventAlreadyAckedError,
     EventBlockedError,
     EventConflictError,
     EventNotFoundError,
     EventStore,
+    InvalidClaimError,
     InvalidCursorError,
     ReplayError,
     content_hash,
@@ -90,6 +95,30 @@ class AckBatchIn(BaseModel):
 
 class AckBatchOut(BaseModel):
     items: list[EventOut]
+
+
+class ClaimIn(BaseModel):
+    # 本次至多领取的事件数量（1~100）；实际可领数量不足时返回更少的项
+    count: int = Field(ge=1, le=MAX_CLAIM_COUNT)
+    # 租约秒数（1~300）：到期未确认的事件可被重新领取，旧令牌随之失效
+    lease_seconds: int = Field(ge=1, le=MAX_LEASE_SECONDS)
+
+
+class ClaimedEventOut(BaseModel):
+    # 被领取的完整事件（字段与 GET /events 的单项一致）
+    event: EventOut
+    # 释放租约所需的不透明令牌；只随领取返回，无法通过其他接口查询
+    token: str
+    # 租约到期时间（6 位小数的 UTC ISO-8601）
+    expires_at: str
+
+
+class ClaimOut(BaseModel):
+    items: list[ClaimedEventOut]
+
+
+class ClaimReleaseIn(BaseModel):
+    token: str = Field(min_length=1, max_length=128)
 
 
 class BlockerRootOut(BaseModel):
@@ -176,7 +205,7 @@ async def lifespan(app: FastAPI):
     db.close()
 
 
-app = FastAPI(title="Webhook Inbox", version="1.4.0", lifespan=lifespan)
+app = FastAPI(title="Webhook Inbox", version="1.5.0", lifespan=lifespan)
 
 
 def get_store(request: Request) -> EventStore:
@@ -424,6 +453,28 @@ def list_ready_events(
         raise HTTPException(status_code=400, detail="invalid cursor")
 
 
+@app.post("/events/claim", response_model=ClaimOut)
+def claim_events(
+    claim: ClaimIn,
+    store: EventStore = Depends(get_store),
+):
+    """领取一批待处理事件（无需签名头），每项返回事件、领取令牌与到期时间。
+
+    只有 `pending`、**全部前置依赖均已 ack** 且**没有未到期领取**的事件可被
+    领取；按 `(created_at, event_id)` 升序选取至多 `count` 项。并发领取在
+    同一写事务内串行分配，两个处理者不会领到同一事件。到期仍未确认的事件
+    可被重新领取，旧令牌随旧租约失效。当前没有可领事件时返回
+    `{"items": []}`（200）；`count` 不在 1~100、`lease_seconds` 不在 1~300
+    时返回 422。领取不改变事件 `pending` 状态，处理完成后仍须调用确认接口。
+    """
+    try:
+        items = store.claim_events(count=claim.count, lease_seconds=claim.lease_seconds)
+    except InvalidClaimError as exc:
+        # Pydantic 已在入口做同样的边界校验；此处为存储层防御性兜底
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    return {"items": items}
+
+
 @app.post("/events/ack-batch", response_model=AckBatchOut)
 def ack_events_batch(
     batch: AckBatchIn,
@@ -524,5 +575,39 @@ def ack_event(event_id: str, store: EventStore = Depends(get_store)):
                 "message": "event has pending dependencies",
                 "event_id": exc.event_id,
                 "blockers": exc.blockers,
+            },
+        )
+
+
+@app.post("/events/{event_id}/release", response_model=EventOut)
+def release_event_claim(
+    event_id: str,
+    body: ClaimReleaseIn,
+    store: EventStore = Depends(get_store),
+):
+    """凭领取令牌提前释放租约（无需签名头）。
+
+    成功后事件保持 `pending` 且立即重新可被领取，返回该事件。事件不存在
+    返回 404；令牌错误（无领取、不匹配或租约已到期导致旧令牌失效）或事件
+    已确认返回 409，两种失败都**不改变任何状态**。
+    """
+    try:
+        return store.release_claim(event_id, body.token)
+    except EventNotFoundError:
+        raise HTTPException(status_code=404, detail="event not found")
+    except EventAlreadyAckedError:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "event already acked",
+                "event_id": event_id,
+            },
+        )
+    except ClaimTokenError:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "invalid or expired claim token",
+                "event_id": event_id,
             },
         )

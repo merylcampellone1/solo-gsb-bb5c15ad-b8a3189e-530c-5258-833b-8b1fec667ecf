@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import json
+import secrets
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -17,6 +19,13 @@ STATUS_ACKED = "acked"
 
 # 每个事件最多声明的唯一依赖数量（API 层同样校验，这里只做防御性常量）
 MAX_DEPENDENCIES = 20
+
+# 领取一批待处理事件的边界：数量 1~100，租期 1~300 秒（API 层同样校验）
+MAX_CLAIM_COUNT = 100
+MAX_LEASE_SECONDS = 300
+
+# 领取令牌的随机字节数（256 bit，urlsafe base64 文本，约 43 字符）
+_CLAIM_TOKEN_BYTES = 32
 
 # 多连接场景下 BEGIN IMMEDIATE 可能立即返回 SQLITE_BUSY；短暂退避后重试，
 # 避免高并发写争用时把可恢复的锁等待冒泡成 500。
@@ -102,10 +111,33 @@ class InvalidCursorError(Exception):
     pass
 
 
+class InvalidClaimError(Exception):
+    """领取参数越界（数量或租期不在允许范围内）。"""
+
+
+class ClaimTokenError(Exception):
+    """提前释放时令牌错误（不存在、不匹配或租约已到期）；状态不变。"""
+
+
+class EventAlreadyAckedError(Exception):
+    """提前释放时目标事件已确认（租约随确认被清除）；状态不变。"""
+
+
 def utcnow_iso() -> str:
     """固定 6 位小数的 UTC ISO-8601 字符串，保证字典序 == 时间序。"""
     now = datetime.now(timezone.utc)
     return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond:06d}Z"
+
+
+def epoch_to_iso(epoch: float) -> str:
+    """Unix 秒（允许小数）转固定 6 位小数的 UTC ISO-8601 字符串。"""
+    dt = datetime.fromtimestamp(epoch, tz=timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond:06d}Z"
+
+
+def new_claim_token() -> str:
+    """生成一次性领取令牌：256 位随机数的 urlsafe base64（无填充）。"""
+    return secrets.token_urlsafe(_CLAIM_TOKEN_BYTES)
 
 
 def canonical_json(value: Any) -> str:
@@ -700,6 +732,8 @@ class EventStore:
                     "UPDATE events SET status = ?, acked_at = ? WHERE event_id = ?",
                     (STATUS_ACKED, utcnow_iso(), event_id),
                 )
+                # 确认即清除领取：该事件不会再被任何处理者持有租约
+                conn.execute("DELETE FROM event_claims WHERE event_id = ?", (event_id,))
                 row = conn.execute(
                     "SELECT * FROM events WHERE event_id = ?", (event_id,)
                 ).fetchone()
@@ -777,6 +811,7 @@ class EventStore:
                 for event_id in ids
                 if by_id[event_id]["status"] == STATUS_ACKED
             }
+            newly_acked: list[str] = []
             remaining = [event_id for event_id in ids if event_id not in acked]
             while remaining:
                 ready = [
@@ -802,7 +837,17 @@ class EventStore:
                         (STATUS_ACKED, utcnow_iso(), event_id),
                     )
                     acked.add(event_id)
+                    newly_acked.append(event_id)
                 remaining = [event_id for event_id in remaining if event_id not in acked]
+
+            # 确认即清除领取：本批新确认事件的租约一并删除（已 ack 条目幂等，
+            # 其租约在首次确认时即已删除）
+            if newly_acked:
+                del_placeholders = ", ".join("?" for _ in newly_acked)
+                conn.execute(
+                    f"DELETE FROM event_claims WHERE event_id IN ({del_placeholders})",
+                    newly_acked,
+                )
 
             rows = conn.execute(
                 f"SELECT * FROM events WHERE event_id IN ({placeholders})", ids
@@ -815,3 +860,122 @@ class EventStore:
         return [
             _row_to_event(by_id[event_id], final_dep_map[event_id]) for event_id in ids
         ]
+
+    def claim_events(self, count: int, lease_seconds: int) -> list[dict]:
+        """领取一批待处理事件并对每项加租约。
+
+        可领取条件（与 /events/ready 的就绪判定一致，另加“无有效领取”）：
+          - status = 'pending'；
+          - 不存在指向仍 pending 事件的依赖边（全部前置已 ack）；
+          - 不存在未到期的 event_claims 行。
+
+        按 (created_at, event_id) 升序选取至多 count 项，为每项生成独立随机
+        令牌并写入租约（expires_at = now + lease_seconds）。先惰性删除所有
+        到期租约：到期未确认的事件因此立即可被重新领取，旧令牌因行被替换
+        而失效。选取与租约插入在同一个 BEGIN IMMEDIATE 事务内、连接级锁 +
+        写锁使并发领取彼此串行，两个处理者不可能领到同一事件。
+
+        返回每项 {"event": 事件记录, "token": 令牌, "expires_at": ISO 字符串}，
+        顺序即领取顺序；没有可领事件时返回 []。count 或 lease_seconds 越界
+        抛 InvalidClaimError（不触碰事务）。
+        """
+        if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= MAX_CLAIM_COUNT:
+            raise InvalidClaimError(
+                f"count must be an integer between 1 and {MAX_CLAIM_COUNT}"
+            )
+        if (
+            isinstance(lease_seconds, bool)
+            or not isinstance(lease_seconds, int)
+            or not 1 <= lease_seconds <= MAX_LEASE_SECONDS
+        ):
+            raise InvalidClaimError(
+                f"lease_seconds must be an integer between 1 and {MAX_LEASE_SECONDS}"
+            )
+
+        def operation(conn):
+            now = time.time()
+            # 到期租约先清除：到期未确认的事件重新可领，旧令牌随旧行消失
+            conn.execute("DELETE FROM event_claims WHERE expires_at <= ?", (now,))
+
+            rows = conn.execute(
+                f"""
+                SELECT * FROM events e
+                WHERE e.status = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM event_dependencies d
+                      JOIN events p ON p.event_id = d.depends_on
+                      WHERE d.event_id = e.event_id AND p.status = 'pending'
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM event_claims c WHERE c.event_id = e.event_id
+                  )
+                ORDER BY e.created_at, e.event_id
+                LIMIT ?
+                """,
+                (STATUS_PENDING, count),
+            ).fetchall()
+
+            claimed_at_iso = utcnow_iso()
+            expires_epoch = now + lease_seconds
+            claimed: list[tuple[str, str]] = []  # (event_id, token)
+            for row in rows:
+                token = new_claim_token()
+                conn.execute(
+                    """
+                    INSERT INTO event_claims (event_id, token, claimed_at, expires_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (row["event_id"], token, claimed_at_iso, expires_epoch),
+                )
+                claimed.append((row["event_id"], token))
+
+            event_ids = [event_id for event_id, _ in claimed]
+            dep_map = _dependencies_for(conn, event_ids)
+            return rows, claimed, dep_map, expires_epoch
+
+        rows, claimed, dep_map, expires_epoch = self._run_immediate_tx(operation)
+        row_by_id = {row["event_id"]: row for row in rows}
+        return [
+            {
+                "event": _row_to_event(row_by_id[event_id], dep_map[event_id]),
+                "token": token,
+                "expires_at": epoch_to_iso(expires_epoch),
+            }
+            for event_id, token in claimed
+        ]
+
+    def release_claim(self, event_id: str, token: str) -> dict:
+        """凭有效令牌提前释放租约；任何失败都不改变状态。
+
+        - 事件不存在：抛 EventNotFoundError（404）；
+        - 事件已确认：抛 EventAlreadyAckedError（409，租约随确认已清除）；
+        - 无租约行、令牌不匹配或租约已到期：抛 ClaimTokenError（409）；
+          到期行在判定前于同一事务内惰性清除，旧令牌必然失效。
+        成功时删除租约行，事件保持 pending 且立即可被再次领取，返回事件记录。
+        令牌比较使用 hmac.compare_digest，不泄露比较位置。
+        """
+
+        def operation(conn):
+            now = time.time()
+            conn.execute("DELETE FROM event_claims WHERE expires_at <= ?", (now,))
+
+            row = conn.execute(
+                "SELECT * FROM events WHERE event_id = ?", (event_id,)
+            ).fetchone()
+            if row is None:
+                raise EventNotFoundError(event_id)
+            if row["status"] == STATUS_ACKED:
+                raise EventAlreadyAckedError(event_id)
+
+            claim = conn.execute(
+                "SELECT token FROM event_claims WHERE event_id = ?", (event_id,)
+            ).fetchone()
+            if claim is None or not hmac.compare_digest(claim["token"], token):
+                raise ClaimTokenError(event_id)
+
+            conn.execute("DELETE FROM event_claims WHERE event_id = ?", (event_id,))
+            dep_map = _dependencies_for(conn, [event_id])
+            return row, dep_map[event_id]
+
+        row, deps = self._run_immediate_tx(operation)
+        return _row_to_event(row, deps)

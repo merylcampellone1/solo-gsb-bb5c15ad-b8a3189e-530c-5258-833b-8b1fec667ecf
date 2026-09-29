@@ -42,6 +42,18 @@ CREATE TABLE IF NOT EXISTS event_dependencies (
 -- 反查“谁依赖某事件”（前置确认后的解锁扫描 / 运维排查）
 CREATE INDEX IF NOT EXISTS idx_event_deps_depends_on
     ON event_dependencies (depends_on);
+
+-- 领取租约：每行表示某 pending 事件被一个处理者持有的有效/历史租约。
+-- 每个事件至多一行（event_id 主键）：重新领取会先清掉到期行再插入新行，
+-- 因此并发领取在写事务串行化下不可能把同一事件分给两个处理者。
+-- expires_at 为 Unix 秒（浮点，含微秒），claim/release/ack 写事务会顺带
+-- 清理 expires_at <= now 的到期行；确认事件时同步删除其租约行。
+CREATE TABLE IF NOT EXISTS event_claims (
+    event_id   TEXT PRIMARY KEY,
+    token      TEXT NOT NULL,                 -- 每次领取生成的不透明随机令牌
+    claimed_at TEXT NOT NULL,                 -- 领取时刻（6 位小数 UTC ISO-8601）
+    expires_at REAL NOT NULL                  -- 到期 Unix 秒；到期后行即失效
+) WITHOUT ROWID;
 """
 
 # 多连接并发打开时，设置 journal_mode=WAL 需要排他锁，可能立即返回

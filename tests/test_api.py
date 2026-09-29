@@ -21,11 +21,14 @@ from app.store import (
     BatchAckBlockedError,
     BatchAckNotFoundError,
     BatchConflictError,
+    ClaimTokenError,
     DependencyError,
+    EventAlreadyAckedError,
     EventBlockedError,
     EventConflictError,
     EventNotFoundError,
     EventStore,
+    InvalidClaimError,
     ReplayError,
 )
 
@@ -1825,3 +1828,322 @@ def test_store_blocker_roots_read_does_not_mutate(store):
     assert store.get_event("b")["status"] == "pending"
     with pytest.raises(EventNotFoundError):
         store.get_blocker_roots("ghost")
+
+
+# ---------- 领取 / 租约：POST /events/claim 与 /events/{id}/release ----------
+
+
+def claim(client, count=50, lease_seconds=300):
+    return client.post(
+        "/events/claim", json={"count": count, "lease_seconds": lease_seconds}
+    )
+
+
+def claim_ids(client, **kw):
+    return [item["event"]["event_id"] for item in claim(client, **kw).json()["items"]]
+
+
+def release(client, event_id: str, token: str):
+    return client.post(f"/events/{event_id}/release", json={"token": token})
+
+
+def test_claim_returns_ready_events_with_token_and_expiry(client):
+    post_event(client, make_event(1))
+    post_event(client, make_event(2))
+    r = claim(client, count=10, lease_seconds=60)
+    assert r.status_code == 200
+    items = r.json()["items"]
+    assert [item["event"]["event_id"] for item in items] == ["evt-0001", "evt-0002"]
+    for item in items:
+        assert item["event"]["status"] == "pending"
+        assert item["event"]["acked_at"] is None
+        assert isinstance(item["token"], str) and len(item["token"]) >= 32
+    # 每项独立令牌
+    assert items[0]["token"] != items[1]["token"]
+    # 同一批共享同一到期时刻，且为带 Z 后缀的 UTC ISO-8601 字符串
+    assert items[0]["expires_at"] == items[1]["expires_at"]
+    assert items[0]["expires_at"].endswith("Z")
+
+
+def test_claim_respects_dependencies_and_creation_order(client):
+    # a 无依赖就绪；b 依赖 a 不可领；c 无依赖就绪。顺序按创建时间
+    post_event(client, event_with_deps("a"))
+    post_event(client, event_with_deps("b", ["a"]))
+    post_event(client, event_with_deps("c"))
+    assert claim_ids(client) == ["a", "c"]
+    # 全部被领取后再次领取为空
+    assert claim(client).json() == {"items": []}
+
+
+def test_claim_respects_count_limit(client):
+    for i in range(1, 6):
+        post_event(client, make_event(i))
+    r = claim(client, count=3, lease_seconds=10)
+    assert [item["event"]["event_id"] for item in r.json()["items"]] == [
+        "evt-0001",
+        "evt-0002",
+        "evt-0003",
+    ]
+    # 剩余的仍可被领取
+    assert claim_ids(client) == ["evt-0004", "evt-0005"]
+
+
+def test_claim_empty_when_nothing_ready(client):
+    r = claim(client)
+    assert r.status_code == 200
+    assert r.json() == {"items": []}
+
+
+def test_claim_does_not_require_signature_headers(client):
+    post_event(client, make_event(1))
+    # 无任何 X-Webhook-* 头即可领取（与 ack 接口同为内部消费接口）
+    r = client.post("/events/claim", json={"count": 1, "lease_seconds": 10})
+    assert r.status_code == 200
+    assert r.json()["items"][0]["event"]["event_id"] == "evt-0001"
+
+
+def test_claim_validation_bounds(client):
+    assert claim(client, count=0, lease_seconds=10).status_code == 422
+    assert claim(client, count=101, lease_seconds=10).status_code == 422
+    assert claim(client, count=1, lease_seconds=0).status_code == 422
+    assert claim(client, count=1, lease_seconds=301).status_code == 422
+    # 边界值合法（空列表而非 4xx）
+    assert claim(client, count=1, lease_seconds=1).status_code == 200
+    assert claim(client, count=100, lease_seconds=300).status_code == 200
+
+
+def test_release_with_valid_token_returns_event_and_makes_reclaimable(client):
+    post_event(client, make_event(1))
+    token = claim(client, count=1, lease_seconds=300).json()["items"][0]["token"]
+    r = release(client, "evt-0001", token)
+    assert r.status_code == 200
+    assert r.json()["event_id"] == "evt-0001"
+    assert r.json()["status"] == "pending"  # 释放不确认，保持 pending
+    # 立即重新可领
+    again = claim(client).json()["items"]
+    assert [item["event"]["event_id"] for item in again] == ["evt-0001"]
+
+
+def test_release_twice_with_same_token_fails_without_state_change(client):
+    post_event(client, make_event(1))
+    token = claim(client).json()["items"][0]["token"]
+    assert release(client, "evt-0001", token).status_code == 200
+    r = release(client, "evt-0001", token)
+    assert r.status_code == 409
+    assert r.json()["detail"]["message"] == "invalid or expired claim token"
+    assert r.json()["detail"]["event_id"] == "evt-0001"
+
+
+def test_release_wrong_token_returns_409_and_keeps_claim(client):
+    post_event(client, make_event(1))
+    items = claim(client).json()["items"]
+    r = release(client, "evt-0001", "not-the-real-token")
+    assert r.status_code == 409
+    assert r.json()["detail"]["message"] == "invalid or expired claim token"
+    # 原租约仍有效：另一处理者领不到，正确令牌仍可释放
+    assert claim(client).json() == {"items": []}
+    assert release(client, "evt-0001", items[0]["token"]).status_code == 200
+
+
+def test_release_without_claim_returns_409(client):
+    post_event(client, make_event(1))
+    r = release(client, "evt-0001", "anything")
+    assert r.status_code == 409
+    assert r.json()["detail"]["message"] == "invalid or expired claim token"
+
+
+def test_release_event_not_found_returns_404(client):
+    r = release(client, "ghost", "tok")
+    assert r.status_code == 404
+    assert r.json() == {"detail": "event not found"}
+
+
+def test_release_empty_token_returns_422(client):
+    post_event(client, make_event(1))
+    r = client.post("/events/evt-0001/release", json={"token": ""})
+    assert r.status_code == 422
+
+
+def test_release_after_ack_returns_409(client):
+    post_event(client, make_event(1))
+    token = claim(client).json()["items"][0]["token"]
+    assert client.post("/events/evt-0001/ack").status_code == 200
+    # 确认后租约已清除：令牌明确失效
+    r = release(client, "evt-0001", token)
+    assert r.status_code == 409
+    assert r.json()["detail"]["message"] == "event already acked"
+
+
+def test_ack_clears_claim_and_event_not_reclaimable(client):
+    post_event(client, make_event(1))
+    claim(client)
+    client.post("/events/evt-0001/ack")
+    assert claim(client).json() == {"items": []}  # 已确认不再出现
+
+
+def test_batch_ack_clears_claims(client):
+    post_event(client, make_event(1))
+    post_event(client, make_event(2))
+    claim(client)
+    r = client.post("/events/ack-batch", json={"event_ids": ["evt-0001", "evt-0002"]})
+    assert r.status_code == 200
+    assert claim(client).json() == {"items": []}
+
+
+def test_claim_unlocked_after_dependency_acked_but_still_respects_other_claims(client):
+    post_event(client, event_with_deps("a"))
+    post_event(client, event_with_deps("b", ["a"]))
+    # b 尚不可领
+    assert claim_ids(client) == ["a"]
+    client.post("/events/a/ack")
+    # a 的领取随确认清除；b 解锁可领
+    assert claim_ids(client) == ["b"]
+
+
+def test_ready_query_still_lists_claimed_pending_events(client):
+    """就绪查询按依赖状态列示，不因领取而隐藏事件。"""
+    post_event(client, event_with_deps("a"))
+    post_event(client, event_with_deps("b", ["a"]))
+    claim(client)  # 领走 a
+    ready = client.get("/events/ready").json()["items"]
+    # a 仍在（被领取但 pending 且依赖已满足）；b 仍不在（前置未确认）
+    assert [e["event_id"] for e in ready] == ["a"]
+
+
+def test_expired_claim_can_be_reclaimed_and_old_token_fails(client, monkeypatch):
+    post_event(client, make_event(1))
+    fake_now = 1_000_000.0
+    monkeypatch.setattr("app.store.time.time", lambda: fake_now)
+    token = claim(client, count=1, lease_seconds=10).json()["items"][0]["token"]
+    # 未到期：不能重复领取
+    assert claim(client).json() == {"items": []}
+    # 旧令牌仍能释放
+    assert release(client, "evt-0001", token).status_code == 200
+    # 再次领取后让租约到期
+    token = claim(client, count=1, lease_seconds=10).json()["items"][0]["token"]
+    monkeypatch.setattr("app.store.time.time", lambda: fake_now + 11)
+    # 到期事件可被重新领取，返回新令牌
+    items = claim(client).json()["items"]
+    assert [i["event"]["event_id"] for i in items] == ["evt-0001"]
+    assert items[0]["token"] != token
+    # 旧令牌失效（状态不变：新租约仍然有效）
+    r = release(client, "evt-0001", token)
+    assert r.status_code == 409
+    assert r.json()["detail"]["message"] == "invalid or expired claim token"
+    assert claim(client).json() == {"items": []}  # 新租约未受影响
+
+
+def test_expired_token_release_reports_invalid_token(client, monkeypatch):
+    post_event(client, make_event(1))
+    fake_now = 2_000_000.0
+    monkeypatch.setattr("app.store.time.time", lambda: fake_now)
+    token = claim(client, count=1, lease_seconds=5).json()["items"][0]["token"]
+    monkeypatch.setattr("app.store.time.time", lambda: fake_now + 6)
+    r = release(client, "evt-0001", token)
+    assert r.status_code == 409
+    assert r.json()["detail"]["message"] == "invalid or expired claim token"
+    # 到期租约已被惰性清理：事件重新可领
+    assert claim_ids(client) == ["evt-0001"]
+
+
+def test_concurrent_claims_never_share_event_api(client):
+    """同一进程多线程并发领取：每个事件恰好被领一次。"""
+    for i in range(40):
+        post_event(client, make_event(i))
+
+    def grab(_):
+        return [
+            item["event"]["event_id"]
+            for item in claim(client, count=10, lease_seconds=300).json()["items"]
+        ]
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        batches = list(pool.map(grab, range(16)))
+    flat = [eid for batch in batches for eid in batch]
+    assert len(flat) == len(set(flat)) == 40
+    assert set(flat) == {f"evt-{i:04d}" for i in range(40)}
+
+
+def test_concurrent_claims_never_share_event_multi_connection(tmp_path):
+    """多连接并发领取：写事务串行化，每个事件只分给一个处理者。"""
+    path = str(tmp_path / "claim-race.db")
+    seed = EventStore(Database(path))
+    for i in range(50):
+        seed.create_event(f"e{i}", "t", {}, source=SOURCE, nonce=f"s{i}")
+    seed.db.close()
+
+    def grab(_):
+        s = EventStore(Database(path))
+        try:
+            return [item["event"]["event_id"] for item in s.claim_events(10, 300)]
+        finally:
+            s.db.close()
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        batches = list(pool.map(grab, range(32)))
+    flat = [eid for batch in batches for eid in batch]
+    assert len(flat) == len(set(flat)) == 50
+
+
+def test_store_claim_invalid_bounds(store):
+    store.create_event("a", "t", {}, source=SOURCE, nonce="c0")
+    with pytest.raises(InvalidClaimError):
+        store.claim_events(0, 10)
+    with pytest.raises(InvalidClaimError):
+        store.claim_events(101, 10)
+    with pytest.raises(InvalidClaimError):
+        store.claim_events(1, 0)
+    with pytest.raises(InvalidClaimError):
+        store.claim_events(1, 301)
+    # 拒绝后状态不变，正常参数仍可领取
+    assert [item["event"]["event_id"] for item in store.claim_events(1, 1)] == ["a"]
+
+
+def test_store_release_error_branches(store):
+    store.create_event("a", "t", {}, source=SOURCE, nonce="c1")
+    with pytest.raises(EventNotFoundError):
+        store.release_claim("ghost", "tok")
+    with pytest.raises(ClaimTokenError):
+        store.release_claim("a", "tok")  # 无领取
+    token = store.claim_events(1, 300)[0]["token"]
+    with pytest.raises(ClaimTokenError):
+        store.release_claim("a", "wrong")
+    assert store.release_claim("a", token)["status"] == "pending"
+    token = store.claim_events(1, 300)[0]["token"]
+    store.ack_event("a")
+    with pytest.raises(EventAlreadyAckedError):
+        store.release_claim("a", token)
+
+
+def test_legacy_database_upgrades_with_claims_table(tmp_path):
+    """旧库（无 event_claims）启动时增量建表，旧 pending 事件可直接领取。"""
+    path = str(tmp_path / "legacy-claims.db")
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE events (
+            event_id TEXT PRIMARY KEY, type TEXT NOT NULL, payload TEXT NOT NULL,
+            content_hash TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL, acked_at TEXT
+        );
+        INSERT INTO events VALUES ('evt-old','t','{}','deadbeef','pending',
+                                   '2026-09-01T00:00:00.000000Z', NULL);
+        CREATE TABLE used_nonces (
+            source TEXT NOT NULL, nonce TEXT NOT NULL, seen_at INTEGER NOT NULL,
+            PRIMARY KEY (source, nonce)
+        ) WITHOUT ROWID;
+        CREATE TABLE event_dependencies (
+            event_id TEXT NOT NULL, depends_on TEXT NOT NULL,
+            PRIMARY KEY (event_id, depends_on)
+        ) WITHOUT ROWID;
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    db = Database(path)
+    store = EventStore(db)
+    items = store.claim_events(10, 60)
+    assert [item["event"]["event_id"] for item in items] == ["evt-old"]
+    assert items[0]["token"] and items[0]["expires_at"].endswith("Z")
+    db.close()
